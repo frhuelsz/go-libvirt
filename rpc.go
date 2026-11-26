@@ -42,6 +42,11 @@ type response struct {
 	Status  uint32
 }
 
+type rpcCallback struct {
+	responses chan response
+	finished  <-chan struct{}
+}
+
 // Error reponse from libvirt
 type Error struct {
 	Code    uint32
@@ -81,7 +86,10 @@ func (l *Libvirt) callback(id int32, res response) {
 		return
 	}
 
-	c <- res
+	select {
+	case c.responses <- res:
+	case <-c.finished:
+	}
 }
 
 // Route sends incoming packets to their listeners.
@@ -222,11 +230,13 @@ func (l *Libvirt) removeAllStreams() {
 }
 
 // register configures a method response callback
-func (l *Libvirt) register(id int32, c chan response) {
+func (l *Libvirt) register(id int32, c chan response) chan struct{} {
 	l.cmux.Lock()
 	defer l.cmux.Unlock()
 
-	l.callbacks[id] = c
+	finished := make(chan struct{})
+	l.callbacks[id] = rpcCallback{responses: c, finished: finished}
+	return finished
 }
 
 // deregister destroys a method response callback. It is the responsibility of
@@ -237,7 +247,7 @@ func (l *Libvirt) deregister(id int32) {
 		return
 	}
 
-	close(l.callbacks[id])
+	close(l.callbacks[id].responses)
 	delete(l.callbacks, id)
 }
 
@@ -268,8 +278,10 @@ func (l *Libvirt) requestStream(proc uint32, program uint32, payload []byte,
 	serial := l.serial()
 	c := make(chan response)
 
-	l.register(serial, c)
+	finished := l.register(serial, c)
 	defer func() {
+		// Release a callback send before waiting for the lock it holds.
+		close(finished)
 		l.cmux.Lock()
 		defer l.cmux.Unlock()
 

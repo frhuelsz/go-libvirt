@@ -17,9 +17,11 @@ package libvirt
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -233,7 +235,7 @@ func TestEncode(t *testing.T) {
 
 func TestRegister(t *testing.T) {
 	l := &Libvirt{}
-	l.callbacks = make(map[int32]chan response)
+	l.callbacks = make(map[int32]rpcCallback)
 	id := int32(1)
 	c := make(chan response)
 
@@ -247,8 +249,8 @@ func TestDeregister(t *testing.T) {
 	id := int32(1)
 
 	l := &Libvirt{}
-	l.callbacks = map[int32]chan response{
-		id: make(chan response),
+	l.callbacks = map[int32]rpcCallback{
+		id: {responses: make(chan response)},
 	}
 
 	l.deregister(id)
@@ -435,8 +437,8 @@ func TestRouteDeadlock(t *testing.T) {
 	rch := make(chan response, 1)
 
 	l := &Libvirt{
-		callbacks: map[int32]chan response{
-			id: rch,
+		callbacks: map[int32]rpcCallback{
+			id: {responses: rch},
 		},
 		events: make(map[int32]*event.Stream),
 	}
@@ -542,6 +544,162 @@ func TestGetResponseInterrupted(t *testing.T) {
 	close(c)
 	_, err := l.getResponse(c)
 	assert.Equal(t, ErrInterrupted, err)
+}
+
+type failingConsoleWriter struct {
+	entered chan struct{}
+	release chan struct{}
+	err     error
+}
+
+func (w failingConsoleWriter) Write([]byte) (int, error) {
+	close(w.entered)
+	<-w.release
+	return 0, w.err
+}
+
+func TestRequestStreamWriterErrorUnblocksCallback(t *testing.T) {
+	l, srv := setupConsoleTest(t)
+	want := errors.New("console destination closed")
+	writer := failingConsoleWriter{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		err:     want,
+	}
+	var release sync.Once
+	t.Cleanup(func() { release.Do(func() { close(writer.release) }) })
+	queued := make(chan struct{})
+	serverDone := make(chan error, 1)
+	go func() {
+		header, _, err := srv.readPacket()
+		if err == nil {
+			err = srv.writePacket(header.Serial, header.Procedure, socket.Reply, socket.StatusOK, nil)
+		}
+		if err == nil {
+			err = srv.writePacket(header.Serial, header.Procedure, socket.Stream, socket.StatusContinue, []byte("first"))
+		}
+		if err == nil {
+			err = srv.writePacket(header.Serial, header.Procedure, socket.Stream, socket.StatusContinue, []byte("late"))
+		}
+		close(queued)
+		for err == nil {
+			header, _, err = srv.readPacket()
+			if err != nil {
+				break
+			}
+			err = srv.writePacket(header.Serial, header.Procedure, socket.Reply, socket.StatusOK, make([]byte, 8))
+			if header.Procedure == constants.ProcConnectClose {
+				break
+			}
+		}
+		serverDone <- err
+	}()
+	result := make(chan error, 1)
+	go func() { result <- l.DomainOpenConsole(Domain{}, nil, writer, 0) }()
+	select {
+	case <-writer.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("console writer was not reached")
+	}
+	select {
+	case <-queued:
+	case <-time.After(2 * time.Second):
+		t.Fatal("late stream packet was not read")
+	}
+	// The first packet has been consumed; the second now blocks callback's
+	// send while the request is still inside the writer.
+	deadline := time.Now().Add(2 * time.Second)
+	for l.cmux.TryLock() {
+		l.cmux.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("callback never blocked delivering the late packet")
+		}
+		runtime.Gosched()
+	}
+	release.Do(func() { close(writer.release) })
+	select {
+	case err := <-result:
+		if !errors.Is(err, want) {
+			t.Fatalf("writer error lost: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("request cleanup deadlocked with the late callback")
+	}
+	go func() {
+		_, err := l.ConnectGetLibVersion()
+		if err == nil {
+			err = l.Disconnect()
+		}
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("later RPC or Disconnect blocked after the writer error")
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDomainOpenConsoleLatePackets(t *testing.T) {
+	for _, mode := range []string{"nil-writer", "stream-end", "early-stream"} {
+		t.Run(mode, func(t *testing.T) {
+			l, srv := setupConsoleTest(t)
+			serverDone := make(chan error, 1)
+			go func() {
+				header, _, err := srv.readPacket()
+				if err == nil && mode == "early-stream" {
+					err = srv.writePacket(header.Serial, header.Procedure, socket.Stream, socket.StatusContinue, []byte("early output"))
+				}
+				if err == nil {
+					err = srv.writePacket(header.Serial, header.Procedure, socket.Reply, socket.StatusOK, nil)
+				}
+				if err == nil && mode != "early-stream" {
+					err = srv.writePacket(header.Serial, header.Procedure, socket.Stream, socket.StatusContinue, []byte("console output"))
+				}
+				if err == nil && mode == "stream-end" {
+					err = srv.writePacket(header.Serial, header.Procedure, socket.Stream, socket.StatusContinue, nil)
+				}
+				if err == nil {
+					err = srv.writePacket(header.Serial, header.Procedure, socket.Stream, socket.StatusOK, nil)
+				}
+				if err == nil {
+					header, _, err = srv.readPacket()
+				}
+				if err == nil {
+					err = srv.writePacket(header.Serial, header.Procedure, socket.Reply, socket.StatusOK, make([]byte, 8))
+				}
+				serverDone <- err
+			}()
+			result := make(chan error, 1)
+			go func() {
+				var output io.Writer
+				if mode != "nil-writer" {
+					output = io.Discard
+				}
+				err := l.DomainOpenConsole(Domain{}, nil, output, 0)
+				if err == nil {
+					_, err = l.ConnectGetLibVersion()
+				}
+				result <- err
+			}()
+			select {
+			case err := <-result:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("late stream packet blocked the console call or subsequent RPC")
+			}
+			if err := <-serverDone; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
 }
 
 // Bidirectional console (proc 201) regression tests for the requestStream

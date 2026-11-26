@@ -70,7 +70,7 @@ type Libvirt struct {
 
 	// method callbacks
 	cmux      sync.RWMutex
-	callbacks map[int32]chan response
+	callbacks map[int32]rpcCallback
 
 	// event listeners
 	emux   sync.RWMutex
@@ -842,7 +842,7 @@ func NewWithDialer(dialer socket.Dialer) *Libvirt {
 	l := &Libvirt{
 		s:            0,
 		disconnected: make(chan struct{}),
-		callbacks:    make(map[int32]chan response),
+		callbacks:    make(map[int32]rpcCallback),
 		events:       make(map[int32]*event.Stream),
 	}
 
